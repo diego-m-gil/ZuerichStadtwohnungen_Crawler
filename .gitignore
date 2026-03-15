@@ -1,0 +1,28 @@
+# Environment variables
+.env
+
+# Database files
+*.db
+
+# Debug artifacts
+website_debug.html
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+
+# Log files
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
