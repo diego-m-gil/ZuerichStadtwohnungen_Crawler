@@ -4,6 +4,8 @@ import sqlite3
 import os
 import asyncio
 import logging
+import re
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 from telegram.ext import ApplicationBuilder
 from datetime import datetime
 import hashlib
@@ -88,10 +90,62 @@ def create_db():
     conn.close()
 
 
+def _normalize_field(s):
+    if not s or not isinstance(s, str):
+        return (s or '').strip()
+    s = s.strip()
+    s = re.sub(r'\s+', ' ', s)
+    return s
+
+
+def normalize_listing_url(url):
+    """Canonical form so the same ad matches even if href differs slightly."""
+    if not url or not isinstance(url, str):
+        return None
+    url = url.strip()
+    if not url or url == 'No link':
+        return None
+    try:
+        p = urlparse(url)
+        scheme = (p.scheme or 'https').lower()
+        netloc = (p.netloc or '').lower()
+        if not netloc:
+            return None
+        path = (p.path or '').rstrip('/') or '/'
+        q = sorted(parse_qsl(p.query, keep_blank_values=True))
+        query = urlencode(q)
+        return urlunparse((scheme, netloc, path, '', query, ''))
+    except Exception:
+        return url
+
+
 def generate_content_hash(address, rentalgross, rooms, floor, area, move_in_date, zone):
     """Hash all listing fields to detect any content change."""
-    content = f"{address}|{rentalgross}|{rooms}|{floor}|{area}|{move_in_date}|{zone}"
+    content = '|'.join(
+        _normalize_field(x)
+        for x in (address, rentalgross, rooms, floor, area, move_in_date, zone)
+    )
     return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+
+def normalize_existing_db_links():
+    """Align stored links with canonical form so scraped rows match DB rows."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT id, link FROM apartments WHERE link IS NOT NULL')
+    for row_id, link in cursor.fetchall():
+        n = normalize_listing_url(link)
+        if n and n != link:
+            cursor.execute('UPDATE apartments SET link = ? WHERE id = ?', (n, row_id))
+    deleted = cursor.execute('''
+        DELETE FROM apartments WHERE link IS NOT NULL AND id NOT IN (
+            SELECT MAX(id) FROM apartments WHERE link IS NOT NULL GROUP BY link
+        )
+    ''').rowcount
+    if deleted:
+        logger.info("Removed %d duplicate rows after link normalization", deleted)
+    conn.commit()
+    conn.close()
 
 
 def fetch_apartments():
@@ -126,7 +180,11 @@ def fetch_apartments():
             zone = zone.text.strip() if zone else 'Keine Angabe'
 
             link_elem = row.find('a', class_='apply_button')
-            link = f"https://www.vermietungen.stadt-zuerich.ch{link_elem['href']}" if link_elem else None
+            raw_link = (
+                f"https://www.vermietungen.stadt-zuerich.ch{link_elem['href']}"
+                if link_elem else None
+            )
+            link = normalize_listing_url(raw_link)
 
             content_hash = generate_content_hash(address, rentalgross, rooms, floor, area, move_in_date, zone)
 
@@ -181,7 +239,15 @@ def detect_changes(apartments):
         if existing is None:
             new_apts.append(apt)
         elif existing[1] != apt['content_hash']:
-            updated_apts.append((apt, existing[2], existing[0]))
+            old_msg_id = existing[2]
+            if old_msg_id is None:
+                logger.warning(
+                    "Content changed for link %s but telegram_message_id is missing — "
+                    "cannot delete old channel message (post may predate tracking or send failed). "
+                    "Ensure the bot is channel admin with delete rights.",
+                    link[:80] + '...' if link and len(link) > 80 else link,
+                )
+            updated_apts.append((apt, old_msg_id, existing[0]))
 
     conn.close()
     return new_apts, updated_apts
@@ -258,7 +324,11 @@ async def delete_telegram_message(app, message_id):
         logger.info("Deleted outdated message (msg_id=%d)", message_id)
         return True
     except Exception as e:
-        logger.warning("Could not delete message %d: %s", message_id, e)
+        logger.warning(
+            "Could not delete message %d (check bot is channel admin with delete rights): %s",
+            message_id,
+            e,
+        )
         return False
 
 
@@ -268,6 +338,7 @@ async def main():
         return
 
     create_db()
+    normalize_existing_db_links()
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
 
@@ -300,10 +371,25 @@ async def main():
             if action == 'update':
                 if old_msg_id:
                     await delete_telegram_message(app, old_msg_id)
+                else:
+                    logger.warning(
+                        "Posting corrected listing without deleting old message (no message_id). "
+                        "Subscribers may see duplicate until old post is removed manually."
+                    )
                 msg_id = await send_telegram_message(app, apt)
+                if msg_id is None:
+                    logger.error(
+                        "Telegram send failed for update; DB not updated so next run can retry."
+                    )
+                    continue
                 update_apartment(db_id, apt, msg_id)
             else:
                 msg_id = await send_telegram_message(app, apt)
+                if msg_id is None:
+                    logger.error(
+                        "Telegram send failed for new listing; not saving to DB so next run can retry."
+                    )
+                    continue
                 save_apartment(apt, msg_id)
     finally:
         await app.shutdown()
