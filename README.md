@@ -27,7 +27,7 @@ The script runs on a schedule (via cron) and:
 ### Clone & Install
 
 ```bash
-git clone https://github.com/yourusername/ZuerichStadtwohnungen_Crawler.git
+git clone https://github.com/diego-m-gil/ZuerichStadtwohnungen_Crawler.git
 cd ZuerichStadtwohnungen_Crawler
 pip install -r requirements.txt
 ```
