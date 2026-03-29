@@ -289,11 +289,10 @@ def update_apartment(db_id, apt, telegram_message_id=None):
     conn.close()
 
 
-def format_apartment_message(apt, label="Neue Stadtwohnung"):
-    """Format a listing message. label can be overridden for corrections."""
+def format_apartment_message(apt):
     link_text = apt['link'] or 'Nicht verfügbar'
     return (
-        f"{label} gefunden am {datetime.now().strftime('%d.%m.%Y')}:\n\n"
+        f"Neue Stadtwohnung gefunden am {datetime.now().strftime('%d.%m.%Y')}:\n\n"
         f"Adresse: {apt['address']}\n"
         f"Zone: Zürich, {apt['zone']}\n"
         f"Bruttomiete: {apt['rentalgross']} CHF\n"
@@ -305,9 +304,9 @@ def format_apartment_message(apt, label="Neue Stadtwohnung"):
     )
 
 
-async def send_telegram_message(app, apt, label="Neue Stadtwohnung"):
+async def send_telegram_message(app, apt):
     """Send an apartment listing to Telegram. Returns the message_id or None."""
-    message = format_apartment_message(apt, label)
+    message = format_apartment_message(apt)
 
     for attempt in range(3):
         try:
@@ -391,7 +390,7 @@ async def main():
 
             if action == 'update':
                 if old_msg_id:
-                    replacement_text = format_apartment_message(apt, label="Korrigierte Stadtwohnung")
+                    replacement_text = format_apartment_message(apt)
                     outcome = await delete_or_edit_telegram_message(app, old_msg_id, replacement_text)
                     if outcome == 'edited':
                         # Old message was edited in place — no new post needed, keep same message_id
@@ -408,7 +407,7 @@ async def main():
                         "Posting corrected listing without removing old message (no stored message_id). "
                         "Subscribers may see duplicate until old post is removed manually."
                     )
-                msg_id = await send_telegram_message(app, apt, label="Korrigierte Stadtwohnung")
+                msg_id = await send_telegram_message(app, apt)
                 if msg_id is None:
                     logger.error(
                         "Telegram send failed for update; DB not updated so next run can retry."
