@@ -289,11 +289,11 @@ def update_apartment(db_id, apt, telegram_message_id=None):
     conn.close()
 
 
-async def send_telegram_message(app, apt):
-    """Send an apartment listing to Telegram. Returns the message_id or None."""
+def format_apartment_message(apt, label="Neue Stadtwohnung"):
+    """Format a listing message. label can be overridden for corrections."""
     link_text = apt['link'] or 'Nicht verfügbar'
-    message = (
-        f"Neue Stadtwohnung gefunden am {datetime.now().strftime('%d.%m.%Y')}:\n\n"
+    return (
+        f"{label} gefunden am {datetime.now().strftime('%d.%m.%Y')}:\n\n"
         f"Adresse: {apt['address']}\n"
         f"Zone: Zürich, {apt['zone']}\n"
         f"Bruttomiete: {apt['rentalgross']} CHF\n"
@@ -303,6 +303,11 @@ async def send_telegram_message(app, apt):
         f"Vermietung ab: {apt['move_in_date']}\n"
         f"Direktlink Bewerbung: {link_text}"
     )
+
+
+async def send_telegram_message(app, apt, label="Neue Stadtwohnung"):
+    """Send an apartment listing to Telegram. Returns the message_id or None."""
+    message = format_apartment_message(apt, label)
 
     for attempt in range(3):
         try:
@@ -317,19 +322,35 @@ async def send_telegram_message(app, apt):
     return None
 
 
-async def delete_telegram_message(app, message_id):
-    """Delete a previously sent message from the Telegram channel."""
+async def delete_or_edit_telegram_message(app, message_id, replacement_text):
+    """Delete a previously sent message, or edit it in place if deletion fails (e.g. >48h old).
+
+    Telegram does not allow bots to delete messages older than ~48 hours even as channel admin.
+    Editing has no such time limit, so we fall back to editing to avoid leaving wrong content visible.
+    """
     try:
         await app.bot.delete_message(chat_id=TELEGRAM_CHAT_ID, message_id=message_id)
         logger.info("Deleted outdated message (msg_id=%d)", message_id)
-        return True
-    except Exception as e:
+        return 'deleted'
+    except Exception as del_err:
         logger.warning(
-            "Could not delete message %d (check bot is channel admin with delete rights): %s",
-            message_id,
-            e,
+            "Could not delete message %d (%s) — falling back to edit in place",
+            message_id, del_err,
         )
-        return False
+        try:
+            await app.bot.edit_message_text(
+                chat_id=TELEGRAM_CHAT_ID,
+                message_id=message_id,
+                text=replacement_text,
+            )
+            logger.info("Edited outdated message in place (msg_id=%d)", message_id)
+            return 'edited'
+        except Exception as edit_err:
+            logger.error(
+                "Could not delete OR edit message %d: delete=%s edit=%s",
+                message_id, del_err, edit_err,
+            )
+            return 'failed'
 
 
 async def main():
@@ -370,13 +391,24 @@ async def main():
 
             if action == 'update':
                 if old_msg_id:
-                    await delete_telegram_message(app, old_msg_id)
+                    replacement_text = format_apartment_message(apt, label="Korrigierte Stadtwohnung")
+                    outcome = await delete_or_edit_telegram_message(app, old_msg_id, replacement_text)
+                    if outcome == 'edited':
+                        # Old message was edited in place — no new post needed, keep same message_id
+                        update_apartment(db_id, apt, old_msg_id)
+                        continue
+                    elif outcome == 'failed':
+                        logger.error(
+                            "Could not delete or edit old message %d for %s; "
+                            "posting corrected version anyway (duplicate will remain).",
+                            old_msg_id, apt['address'],
+                        )
                 else:
                     logger.warning(
-                        "Posting corrected listing without deleting old message (no message_id). "
+                        "Posting corrected listing without removing old message (no stored message_id). "
                         "Subscribers may see duplicate until old post is removed manually."
                     )
-                msg_id = await send_telegram_message(app, apt)
+                msg_id = await send_telegram_message(app, apt, label="Korrigierte Stadtwohnung")
                 if msg_id is None:
                     logger.error(
                         "Telegram send failed for update; DB not updated so next run can retry."
