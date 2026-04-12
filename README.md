@@ -4,17 +4,28 @@ Automated web scraper that monitors apartment listings from Zürich's public hou
 
 For more details about the listings and rental guidelines, visit the official website at [stadt-zuerich.ch/e-vermietung](https://www.stadt-zuerich.ch/e-vermietung).
 
-## How It Works
+## Repository layout
+
+| Path | Purpose |
+|------|---------|
+| `ZuerichStadtwohnungen_Crawler.py` | Main crawler + Telegram (entry point for cron) |
+| `requirements.txt` / `.env.template` | Dependencies and env template |
+| `scripts/` | Debug scraper, CSV export, Windows SSH helper — see `scripts/README.md` |
+| `docs/` | Notes for data exports (e.g. `EXPORT_HINWEISE.txt`) |
+| `exports/` | Local output folder for CSV/HTML (gitignored contents; see `exports/README.md`) |
+| `apartments.db` | SQLite DB (created at repo root when you run the main script) |
+
+## How it works
 
 The script runs on a schedule (via cron) and:
 
 1. **Scrapes** apartment listings from [vermietungen.stadt-zuerich.ch](https://www.vermietungen.stadt-zuerich.ch/publication/apartment/)
 2. **Compares** each listing against the SQLite database using the application link as the unique identifier
-3. **Detects changes** — if an existing listing was corrected (price, address, etc.), the old Telegram message is deleted and a new one is posted
+3. **Detects changes** — if an existing listing was corrected (price, address, etc.), the bot deletes or edits the old Telegram message and posts/updates as needed
 4. **Posts new listings** to the Telegram channel with address, rent, rooms, floor, area, move-in date, zone, and a direct application link
 5. **Stores** each listing with its Telegram message ID so corrections can be handled cleanly
 
-## Tech Stack
+## Tech stack
 
 - **Python 3.8+**
 - **BeautifulSoup** — HTML parsing
@@ -24,7 +35,7 @@ The script runs on a schedule (via cron) and:
 
 ## Setup
 
-### Clone & Install
+### Clone and install
 
 ```bash
 git clone https://github.com/diego-m-gil/ZuerichStadtwohnungen_Crawler.git
@@ -33,8 +44,6 @@ pip install -r requirements.txt
 ```
 
 ### Configuration
-
-Copy `.env.template` to `.env` and fill in your credentials:
 
 ```bash
 cp .env.template .env
@@ -45,7 +54,7 @@ TELEGRAM_BOT_TOKEN=your_bot_token
 TELEGRAM_CHAT_ID=your_channel_chat_id
 ```
 
-The bot must be an **admin** of the Telegram channel with permission to post and delete messages.
+The bot must be an **admin** of the Telegram channel with permission to post, delete, and edit messages.
 
 ### Run
 
@@ -53,29 +62,27 @@ The bot must be an **admin** of the Telegram channel with permission to post and
 python ZuerichStadtwohnungen_Crawler.py
 ```
 
-### Schedule with Cron
+### Cron (example)
 
 ```bash
-*/15 * * * * cd /home/ubuntu/ZuerichStadtwohnungen_Crawler && /home/ubuntu/ZuerichStadtwohnungen_Crawler/venv/bin/python ZuerichStadtwohnungen_Crawler.py >> crawler.log 2>&1
+*/15 * * * * cd /home/ubuntu/ZuerichStadtwohnungen_Crawler && /path/to/venv/bin/python ZuerichStadtwohnungen_Crawler.py >> logs/crawler.log 2>&1
 ```
 
-### Debug
+Keep **`ZuerichStadtwohnungen_Crawler.py` at the repository root** on the server so existing cron paths keep working. You can still `git pull` the rest of the repo (including `scripts/`).
 
-Run the debug script to test scraping and deduplication without sending Telegram messages:
+### Debug (no Telegram)
 
 ```bash
-python debug_crawler.py
+python scripts/debug_crawler.py
 ```
 
-## Project Files
+### Export listings to CSV
 
-| File | Purpose |
-|------|---------|
-| `ZuerichStadtwohnungen_Crawler.py` | Main crawler + Telegram posting |
-| `debug_crawler.py` | Debug scraping & DB logic (no Telegram) |
-| `requirements.txt` | Python dependencies |
-| `.env.template` | Template for environment variables |
-| `apartments.db` | SQLite database (auto-created) |
+```bash
+python scripts/export_listings.py
+```
+
+Default output: `exports/stadtwohnungen_export_YYYYMMDD.csv`. Pair with `docs/EXPORT_HINWEISE.txt` when sharing data.
 
 ## License
 

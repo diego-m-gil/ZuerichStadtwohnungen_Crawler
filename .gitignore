@@ -4,9 +4,6 @@
 # Database files
 *.db
 
-# Debug artifacts
-website_debug.html
-
 # Python cache
 __pycache__/
 *.py[cod]
@@ -23,9 +20,15 @@ env/
 # Log files
 *.log
 
-# Local CSV exports (may contain many listings; do not commit)
+# Local exports (CSV, zips, HTML snapshots — keep exports/README.md tracked)
+exports/*.csv
+exports/*.zip
+exports/website_debug.html
+
+# Legacy paths (if any old files remain at repo root)
 stadtwohnungen_export_*.csv
 stadtwohnungen_stadt_zuerich_export_*.zip
+website_debug.html
 
 # OS files
 .DS_Store

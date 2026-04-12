@@ -2,20 +2,29 @@
 """
 Debug script for ZuerichStadtwohnungen_Crawler.
 Tests scraping and DB logic without sending Telegram messages.
+
+Run from anywhere:
+  python scripts/debug_crawler.py
 """
+
+from pathlib import Path
 
 import requests
 from bs4 import BeautifulSoup
 import sqlite3
-import os
 from datetime import datetime
 import hashlib
 from dotenv import load_dotenv
 
-load_dotenv()
+ROOT = Path(__file__).resolve().parent.parent
+EXPORTS_DIR = ROOT / 'exports'
+EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+load_dotenv(ROOT / '.env')
 
 URL = "https://www.vermietungen.stadt-zuerich.ch/publication/apartment/"
-DB_PATH = 'apartments_debug.db'
+DB_PATH = str(ROOT / 'apartments_debug.db')
+WEBSITE_DEBUG_HTML = EXPORTS_DIR / 'website_debug.html'
 
 
 def _create_apartments_table(cursor):
@@ -58,9 +67,8 @@ def test_website_connection():
         response = requests.get(URL, timeout=10)
         print(f"  Status Code: {response.status_code}")
         print(f"  Content Length: {len(response.text)} bytes")
-        with open('website_debug.html', 'w', encoding='utf-8') as f:
-            f.write(response.text)
-        print("  Saved HTML to website_debug.html")
+        WEBSITE_DEBUG_HTML.write_text(response.text, encoding='utf-8')
+        print(f"  Saved HTML to {WEBSITE_DEBUG_HTML.relative_to(ROOT)}")
         return response
     except Exception as e:
         print(f"  ERROR: {e}")
