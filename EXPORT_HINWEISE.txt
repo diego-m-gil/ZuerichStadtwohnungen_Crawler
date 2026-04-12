@@ -1,0 +1,29 @@
+Datenexport: Stadtwohnungen Stadt Zürich (Vermietungsinserate)
+================================================================
+
+Inhalt
+------
+Die CSV-Datei enthält die Felder, die vom öffentlichen Portal
+https://www.vermietungen.stadt-zuerich.ch/publication/apartment/
+über die Zeit erfasst wurden (Adresse, Miete, Zimmer, Stockwerk,
+Fläche, Bezugsdatum, Kreis/Zone, Link zur Bewerbung, Zeitpunkt
+der ersten Erfassung durch den Crawler).
+
+Herkunft & Einschränkungen
+--------------------------
+- Es handelt sich nicht um eine offizielle Veröffentlichung der Stadt
+  Zürich, sondern um eine private Datensammlung aus dem öffentlichen Web.
+- Vollständigkeit und Aktualität sind nicht garantiert: es fehlen alle
+  Inserate, die vor Beginn der Erfassung online waren oder die der
+  Crawler nie gesehen hat.
+- Korrekturen am Portal können dazu führen, dass in der Datenbank nur
+  der zuletzt gesehene Stand pro Bewerbungslink gespeichert ist.
+- Die Spalte „erfasst_utc“ ist der Zeitstempel, zu dem der Crawler die
+  Zeile zuerst gespeichert hat (lokale ISO-Zeit des Servers, nicht
+  zwingend die Veröffentlichungszeit der Stadt).
+
+Nutzung
+-------
+Nur für persönliche / berufliche Auswertung (z. B. Marktbeobachtung).
+Bitte keine Weitergabe sensibler Inhalte; Bewerbungslinks sind
+personenbezogene Prozesse der Stadt — verantwortungsvoll verwenden.

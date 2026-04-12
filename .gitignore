@@ -23,6 +23,10 @@ env/
 # Log files
 *.log
 
+# Local CSV exports (may contain many listings; do not commit)
+stadtwohnungen_export_*.csv
+stadtwohnungen_stadt_zuerich_export_*.zip
+
 # OS files
 .DS_Store
 Thumbs.db
