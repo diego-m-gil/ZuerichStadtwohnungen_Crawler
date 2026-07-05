@@ -5,10 +5,11 @@ import os
 import asyncio
 import logging
 import re
-from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
+from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, urljoin
 from telegram.ext import ApplicationBuilder
 from datetime import datetime
 import hashlib
+import html
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,9 +25,26 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.getenv('TELEGRAM_CHAT_ID')
-URL = "https://www.vermietungen.stadt-zuerich.ch/publication/apartment/"
+STZH_USERNAME = os.getenv('STZH_USERNAME')
+STZH_PASSWORD = os.getenv('STZH_PASSWORD')
+
+# Note: the listings live on the non-www host (emonitor "melon.rent" platform).
+# www and non-www are different hosts and do NOT share the login session cookies.
+BASE_URL = "https://vermietungen.stadt-zuerich.ch"
+# Listings now come from a JSON API (the site renders them client-side); the old
+# /publication/apartment/ HTML page is legacy and always empty.
+API_URL = f"{BASE_URL}/api/public/objects/apartments-list?objecttype=apartment"
+# Any protected path triggers the OIDC login redirect; we use it to start the login flow.
+LOGIN_START_URL = f"{BASE_URL}/protected_access/"
 DB_PATH = 'apartments.db'
 MESSAGE_DELAY_SECONDS = 3
+
+# When set (DRY_RUN=1), the crawler does everything EXCEPT send/delete/edit Telegram
+# messages. It logs what it WOULD do. Used for safe live tests without notifying users.
+DRY_RUN = os.getenv('DRY_RUN', '').strip() in ('1', 'true', 'True', 'yes')
+
+USER_AGENT = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/124.0 Safari/537.36')
 
 
 def _create_apartments_table(cursor):
@@ -43,7 +61,8 @@ def _create_apartments_table(cursor):
             link TEXT,
             timestamp TEXT,
             unique_hash TEXT,
-            telegram_message_id INTEGER
+            telegram_message_id INTEGER,
+            grundriss TEXT
         )
     ''')
 
@@ -86,6 +105,13 @@ def create_db():
                 cursor.execute('UPDATE apartments SET unique_hash = ? WHERE id = ?', (new_hash, row[0]))
             logger.info("Recalculated content hashes for all existing records")
             logger.info("Database migration complete")
+
+        # Incremental migration: add grundriss (floor plan link) column if missing.
+        cursor.execute("PRAGMA table_info(apartments)")
+        columns = {col[1] for col in cursor.fetchall()}
+        if 'grundriss' not in columns:
+            cursor.execute('ALTER TABLE apartments ADD COLUMN grundriss TEXT')
+            logger.info("Added grundriss column")
     else:
         _create_apartments_table(cursor)
 
@@ -122,11 +148,15 @@ def normalize_listing_url(url):
         return url
 
 
-def generate_content_hash(address, rentalgross, rooms, floor, area, move_in_date, zone):
-    """Hash all listing fields to detect any content change."""
+def generate_content_hash(*fields):
+    """Hash the given listing fields to detect any content change.
+
+    Accepts a variable number of fields so the same function works for both the
+    legacy 7-column migration recalculation and the richer API-based fields.
+    """
     content = '|'.join(
-        _normalize_field(x)
-        for x in (address, rentalgross, rooms, floor, area, move_in_date, zone)
+        _normalize_field(x if isinstance(x, str) else ('' if x is None else str(x)))
+        for x in fields
     )
     return hashlib.md5(content.encode('utf-8')).hexdigest()
 
@@ -151,59 +181,176 @@ def normalize_existing_db_links():
     conn.close()
 
 
-def fetch_apartments():
-    """Scrape apartment listings from the website."""
-    logger.info("Fetching apartments from %s", URL)
-    response = requests.get(URL, timeout=30)
+def login_session():
+    """Log in via the email/password OIDC form flow and return an authenticated session.
+
+    Returns the session (authenticated if credentials worked). Never logs credentials.
+    """
+    session = requests.Session()
+    session.headers.update({'User-Agent': USER_AGENT, 'Accept-Language': 'de-CH,de;q=0.9'})
+
+    if not STZH_USERNAME or not STZH_PASSWORD:
+        logger.warning("STZH_USERNAME / STZH_PASSWORD not set — fetching without login")
+        return session
+
+    try:
+        r = session.get(LOGIN_START_URL, timeout=30)
+        if 'login.stadt-zuerich.ch' not in r.url:
+            logger.info("No login redirect encountered (data may be public); continuing")
+            return session
+
+        soup = BeautifulSoup(r.text, 'html.parser')
+        form = soup.find('form', attrs={'name': 'Email'})
+        if not form:
+            for f in soup.find_all('form'):
+                if f.find('input', attrs={'name': 'password'}):
+                    form = f
+                    break
+        if not form:
+            logger.error("Login form not found on login page — proceeding unauthenticated")
+            return session
+
+        action = urljoin(r.url, form.get('action', 'auth'))
+        payload = {}
+        for inp in form.find_all('input'):
+            name = inp.get('name')
+            if name:
+                payload[name] = inp.get('value', '')
+        payload['userid'] = STZH_USERNAME
+        payload['password'] = STZH_PASSWORD
+        payload.setdefault('logins', 'email')
+
+        r2 = session.post(action, data=payload, timeout=30)
+        if 'login.stadt-zuerich.ch' in r2.url:
+            logger.error("Login did not complete (still on login host) — check credentials/2FA")
+        else:
+            logger.info("Login successful")
+    except Exception as e:
+        logger.error("Login flow error: %s", e)
+
+    return session
+
+
+def _fmt_num(x):
+    """Render API numbers cleanly: 45.0 -> '45', 1.5 -> '1.5', None -> ''."""
+    if x is None or x == '':
+        return ''
+    try:
+        return f'{float(x):g}'
+    except (ValueError, TypeError):
+        return str(x)
+
+
+def _is_public_url(u):
+    """True only for links on publicly-resolvable hosts.
+
+    The API sometimes returns internal storage URLs (e.g. host ending in `.szh.loc`
+    on port 9021) that resolve only inside the city network — those are useless to
+    subscribers, so we must not post them.
+    """
+    if not u or not isinstance(u, str) or not u.startswith('http'):
+        return False
+    host = (urlparse(u).hostname or '').lower()
+    if not host or '.' not in host:
+        return False
+    if host in ('localhost',) or host.endswith('.loc') or host.endswith('.local') or host.endswith('.internal'):
+        return False
+    return True
+
+
+def _extract_apply_link(item):
+    """The stable per-listing link (embeds the uuid) used as the dedup key."""
+    html = item.get('apply_button') or ''
+    if html:
+        a = BeautifulSoup(html, 'html.parser').find('a', href=True)
+        if a and a['href']:
+            return a['href']
+    uuid = item.get('uuid')
+    if uuid:
+        return f"{BASE_URL}/form/application/new?uuids={uuid}"
+    return None
+
+
+def fetch_apartments(session=None):
+    """Fetch apartment listings from the site's JSON API (authenticated session required)."""
+    logger.info("Fetching apartments from API %s", API_URL)
+    getter = session.get if session is not None else requests.get
+    headers = {
+        'Accept': 'application/json, text/plain, */*',
+        'X-Requested-With': 'XMLHttpRequest',
+        'Referer': f'{BASE_URL}/de/',
+    }
+    response = getter(API_URL, headers=headers, timeout=45)
     response.raise_for_status()
-    soup = BeautifulSoup(response.text, 'html.parser')
+
+    ctype = response.headers.get('Content-Type', '')
+    if 'json' not in ctype:
+        logger.error(
+            "API did not return JSON (Content-Type=%s) — likely not authenticated. "
+            "First 200 chars: %s",
+            ctype, response.text[:200].replace('\n', ' '),
+        )
+        return []
+    try:
+        items = response.json()
+    except ValueError as e:
+        logger.error("Failed to parse API JSON: %s", e)
+        return []
+    if not isinstance(items, list):
+        logger.error("Unexpected API JSON shape: %s", type(items).__name__)
+        return []
 
     apartments = []
-    for row in soup.select('table tbody tr'):
+    for item in items:
         try:
-            address = row.find('td', class_='publicated_adress')
-            address = address.text.strip() if address else 'Keine Angabe'
+            street = _normalize_field(item.get('street_and_number') or '')
+            city = _normalize_field(item.get('postcode_and_city') or '')
+            address = ', '.join(p for p in (street, city) if p) or 'Keine Angabe'
+            building = _normalize_field(item.get('building') or '')
+            property_type = _normalize_field(item.get('property_type') or item.get('object_type_name') or '')
+            rooms = _fmt_num(item.get('rooms'))
+            area = _fmt_num(item.get('area'))
+            floor = _normalize_field(item.get('floor') or '')
+            move_in_date = _normalize_field(item.get('move_in_date') or '')
+            rentalgross = _fmt_num(item.get('rentalgross'))
+            rentalgross_net = _fmt_num(item.get('rentalgross_net'))
+            incidental_costs = _fmt_num(item.get('incidental_costs'))
+            price_m2 = _fmt_num(item.get('rentalprice_squaremeter'))
+            reference = _normalize_field(item.get('reference_number') or '')
 
-            rentalgross = row.find('td', class_='rentalgross')
-            rentalgross = rentalgross.text.strip() if rentalgross else 'Keine Angabe'
+            link = normalize_listing_url(_extract_apply_link(item))
 
-            rooms = row.find('td', class_='rooms')
-            rooms = rooms.text.strip() if rooms else 'Keine Angabe'
+            layout = item.get('layout_plan') or ''
+            grundriss = layout if _is_public_url(layout) else None
+            tour = item.get('virtual_tour_link') or ''
+            virtual_tour = tour if _is_public_url(tour) else None
 
-            floor = row.find('td', class_='floor')
-            floor = floor.text.strip() if floor else 'Keine Angabe'
-
-            area = row.find('td', class_='area')
-            area = area.text.strip() if area else 'Keine Angabe'
-
-            move_in_date = row.find('td', class_='move_in_date')
-            move_in_date = move_in_date.text.strip() if move_in_date else 'Keine Angabe'
-
-            zone = row.find('td', class_='metropolitan')
-            zone = zone.text.strip() if zone else 'Keine Angabe'
-
-            link_elem = row.find('a', class_='apply_button')
-            raw_link = (
-                f"https://www.vermietungen.stadt-zuerich.ch{link_elem['href']}"
-                if link_elem else None
+            content_hash = generate_content_hash(
+                address, building, property_type, rooms, area, floor,
+                move_in_date, rentalgross, rentalgross_net, incidental_costs,
             )
-            link = normalize_listing_url(raw_link)
-
-            content_hash = generate_content_hash(address, rentalgross, rooms, floor, area, move_in_date, zone)
 
             apartments.append({
                 'address': address,
-                'rentalgross': rentalgross,
+                'building': building,
+                'property_type': property_type,
                 'rooms': rooms,
-                'floor': floor,
                 'area': area,
+                'floor': floor,
                 'move_in_date': move_in_date,
-                'zone': zone,
+                'rentalgross': rentalgross,
+                'rentalgross_net': rentalgross_net,
+                'incidental_costs': incidental_costs,
+                'price_m2': price_m2,
+                'reference': reference,
+                'zone': city,  # retained for DB schema/back-compat
                 'link': link,
+                'grundriss': grundriss,
+                'virtual_tour': virtual_tour,
                 'content_hash': content_hash,
             })
         except Exception as e:
-            logger.warning("Error processing row: %s", e)
+            logger.warning("Error processing listing item: %s", e)
             continue
 
     logger.info("Fetched %d apartments", len(apartments))
@@ -263,11 +410,12 @@ def save_apartment(apt, telegram_message_id=None):
     cursor.execute(
         '''INSERT INTO apartments
            (address, rentalgross, rooms, floor, area, move_in_date,
-            zone, link, timestamp, unique_hash, telegram_message_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+            zone, link, timestamp, unique_hash, telegram_message_id, grundriss)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
         (apt['address'], apt['rentalgross'], apt['rooms'], apt['floor'],
          apt['area'], apt['move_in_date'], apt['zone'], apt['link'],
-         datetime.now().isoformat(), apt['content_hash'], telegram_message_id)
+         datetime.now().isoformat(), apt['content_hash'], telegram_message_id,
+         apt.get('grundriss'))
     )
     conn.commit()
     conn.close()
@@ -281,30 +429,59 @@ def update_apartment(db_id, apt, telegram_message_id=None):
         '''UPDATE apartments
            SET address=?, rentalgross=?, rooms=?, floor=?, area=?,
                move_in_date=?, zone=?, timestamp=?, unique_hash=?,
-               telegram_message_id=?
+               telegram_message_id=?, grundriss=?
            WHERE id=?''',
         (apt['address'], apt['rentalgross'], apt['rooms'], apt['floor'],
          apt['area'], apt['move_in_date'], apt['zone'],
          datetime.now().isoformat(), apt['content_hash'],
-         telegram_message_id, db_id)
+         telegram_message_id, apt.get('grundriss'), db_id)
     )
     conn.commit()
     conn.close()
 
 
 def format_apartment_message(apt):
-    link_text = apt['link'] or 'Nicht verfügbar'
-    return (
-        f"Neue Stadtwohnung gefunden am {datetime.now().strftime('%d.%m.%Y')}:\n\n"
-        f"Adresse: {apt['address']}\n"
-        f"Zone: Zürich, {apt['zone']}\n"
-        f"Bruttomiete: {apt['rentalgross']} CHF\n"
-        f"Zimmer: {apt['rooms']}\n"
-        f"Stockwerk: {apt['floor']}\n"
-        f"Fläche: {apt['area']}\n"
-        f"Vermietung ab: {apt['move_in_date']}\n"
-        f"Direktlink Bewerbung: {link_text}"
-    )
+    """Build the Telegram message (HTML parse mode) with clean tappable links."""
+    def esc(x):
+        return html.escape(str(x)) if x else ''
+
+    lines = [
+        f"Neue Stadtwohnung gefunden am {datetime.now().strftime('%d.%m.%Y')}:",
+        "",
+        f"Adresse: {esc(apt['address'])}",
+    ]
+    if apt.get('building'):
+        lines.append(f"Siedlung: {esc(apt['building'])}")
+    if apt.get('property_type'):
+        lines.append(f"Typ: {esc(apt['property_type'])}")
+    if apt.get('rooms'):
+        lines.append(f"Zimmer: {esc(apt['rooms'])}")
+    if apt.get('area'):
+        lines.append(f"Fläche: {esc(apt['area'])} m²")
+    if apt.get('floor'):
+        lines.append(f"Stockwerk: {esc(apt['floor'])}")
+
+    rent = f"Bruttomiete: {esc(apt['rentalgross'])} CHF"
+    if apt.get('rentalgross_net') and apt.get('incidental_costs'):
+        rent += f" (Netto {esc(apt['rentalgross_net'])} + Nebenkosten {esc(apt['incidental_costs'])})"
+    lines.append(rent)
+
+    if apt.get('move_in_date'):
+        lines.append(f"Vermietung ab: {esc(apt['move_in_date'])}")
+
+    lines.append("")
+    link_parts = []
+    if apt.get('link'):
+        link_parts.append(f'<a href="{html.escape(apt["link"], quote=True)}">Jetzt bewerben</a>')
+    else:
+        link_parts.append('Bewerbung: Nicht verfügbar')
+    if apt.get('grundriss'):
+        link_parts.append(f'<a href="{html.escape(apt["grundriss"], quote=True)}">Grundriss (PDF)</a>')
+    if apt.get('virtual_tour'):
+        link_parts.append(f'<a href="{html.escape(apt["virtual_tour"], quote=True)}">360°-Rundgang</a>')
+    lines.append("  ·  ".join(link_parts))
+
+    return "\n".join(lines)
 
 
 async def send_telegram_message(app, apt):
@@ -313,7 +490,7 @@ async def send_telegram_message(app, apt):
 
     for attempt in range(3):
         try:
-            sent = await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+            sent = await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message, parse_mode='HTML')
             logger.info("Message sent for: %s (msg_id=%d)", apt['address'], sent.message_id)
             return sent.message_id
         except Exception as e:
@@ -344,6 +521,7 @@ async def delete_or_edit_telegram_message(app, message_id, replacement_text):
                 chat_id=TELEGRAM_CHAT_ID,
                 message_id=message_id,
                 text=replacement_text,
+                parse_mode='HTML',
             )
             logger.info("Edited outdated message in place (msg_id=%d)", message_id)
             return 'edited'
@@ -360,12 +538,16 @@ async def main():
         logger.error("TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env or environment")
         return
 
+    if DRY_RUN:
+        logger.info("DRY_RUN enabled — no Telegram messages will be sent, deleted, or edited")
+
     create_db()
     normalize_existing_db_links()
 
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).connect_timeout(30).read_timeout(30).build()
 
-    apartments = fetch_apartments()
+    session = login_session()
+    apartments = fetch_apartments(session)
     if not apartments:
         logger.info("No apartments found on the website")
         return
@@ -377,6 +559,15 @@ async def main():
 
     if not new_apts and not updated_apts:
         logger.info("Nothing to do")
+        return
+
+    if DRY_RUN:
+        for apt in new_apts:
+            logger.info("[DRY_RUN] would POST new listing:\n%s", format_apartment_message(apt))
+        for apt, old_msg_id, _db_id in updated_apts:
+            logger.info("[DRY_RUN] would REPLACE msg_id=%s for updated listing:\n%s",
+                        old_msg_id, format_apartment_message(apt))
+        logger.info("[DRY_RUN] done — DB left unchanged, no messages sent")
         return
 
     await app.initialize()
